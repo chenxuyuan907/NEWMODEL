@@ -1,4 +1,4 @@
-### Bayesprism
+### BayesPrism
 library(BayesPrism)
 library(Seurat)
 library(dplyr)
@@ -52,25 +52,25 @@ myPrism <- new.prism(
 )
 bp.res <- run.prism(prism = myPrism, n.cores=64)
 
-### Run mr.mash
-library(parallel)
+### Run mr.mash with optimized parameters
+library(doParallel)
+library(foreach)
 library(mr.mash.alpha)
-library(pbapply)  
-
-# Get all gene names
+library(pbapply)
 gene_files <- list.files(zcellgene_dir, pattern = "\\.csv$")
 gene_names <- sub("\\.csv$", "", gene_files)
-# Take n genes for testing
 test_genes <- gene_names[1:n]
 
-# mr.mash main function
+# mr.mash main function 
 process_gene <- function(gene) {
   tryCatch({
     Y <- read.csv(file.path(zcellgene_dir, paste0(gene, ".csv")))
     X <- read.csv(file.path(genotype_dir, paste0(gene, "_sum.csv")))
+
     X <- X[, sapply(X, is.numeric)]
     X_std <- scale(X, center = TRUE, scale = TRUE)
     X <- as.matrix(X_std)
+
     Y <- as.matrix(Y)
     Y <- Y[, -1] 
     Y_num <- matrix(as.numeric(Y), nrow = nrow(Y), ncol = ncol(Y))
@@ -78,22 +78,44 @@ process_gene <- function(gene) {
     rownames(Y_num) <- rownames(Y)
     Y <- scale(Y_num)
     Y[is.na(Y)] <- 0
-    S0 <- compute_canonical_covs(ncol(Y))
-    fit <- mr.mash(X, Y, S0, V = diag(ncol(Y)) * 0.00001 + cov(Y) * 0.99999, nthreads = 1)
+
+    S0 <- compute_canonical_covs(ncol(Y), singletons = FALSE, hetgrid = c(0, 0.001, 0.01))
+
+    univ_sumstats <- compute_univariate_sumstats(X, Y, standardize = TRUE)
+    scaling_grid <- autoselect.mixsd(univ_sumstats, mult = sqrt(2))^2
+
+    S0 <- expand_covs(S0, scaling_grid)
+    S0 <- expand_covs(S0, scaling_grid, zeromat = TRUE)
+
+    fit <- mr.mash(
+      X, Y, S0, 
+      w0 = rep(1 / length(S0), length(S0)),
+      V = diag(ncol(Y)) * 0.00001 + cov(Y) * 0.99999,
+      update_V = TRUE, 
+      nthreads = 1
+    )
+    
     save(fit, file = file.path(output_dir, paste0(gene, "model_fit.RData")))
     return(paste(gene, "completed successfully"))
+    
   }, error = function(e) {
     return(paste("Error processing", gene, ":", e$message))
   })
 }
 
-num_cores <- 64  
-cl <- makeCluster(num_cores)
-clusterExport(cl, c("zcellgene_dir", "genotype_dir", "output_dir", "compute_canonical_covs", "mr.mash"))
-pboptions(type = "txt", style = 3, char = "=")
-results <- pblapply(cl = cl, X = test_genes, FUN = process_gene)
-stopCluster(cl)
+cat("Setting up parallel processing with", num_cores, "cores...\n")
+registerDoParallel(cores = num_cores)
 
+results <- foreach(
+  gene = test_genes,
+  .packages = c("mr.mash.alpha"),
+  .combine = "c",
+  .errorhandling = "pass"
+) %dopar% {
+  process_gene(gene)
+}
+
+stopImplicitCluster()
 
 ### Calculate Z_score and use Cauchy combination to find P-value.
 library(readr)
