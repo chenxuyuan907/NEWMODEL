@@ -1,0 +1,826 @@
+#Obtain the reads for each gene using the Poisson distribution.
+set.seed(123)
+n_samples <- 576
+n_tissues <- 9 
+n_genes <- 2000 
+dropout_rate <- 0.7  
+adjusted_alpha_mean <- 0.5    
+adjusted_alpha_sd <- 0.2     
+adjusted_L_shape <- 5        
+adjusted_L_rate <- 0.5        
+adjusted_noise_sd <- 0.2      
+genotype_dir <- "your data"
+expression_dir <- "your data"
+file_list <- list.files(genotype_dir, pattern = "_sum\\.csv$", full.names = TRUE)
+file_list <- file_list[1:n_genes]
+#Define the proportions of different causal genes.
+causal_proportions <- c(0.01, 0.02, 0.03, 0.04, 0.05)  
+generate_beta <- function(p_causal, scenario, n_tissues) {
+  beta <- matrix(0, nrow = p_causal, ncol = n_tissues)
+  if (scenario == "Equal Effects") {
+    beta[, ] <- rnorm(p_causal, mean = 1, sd = 0.2)
+  } else if (scenario == "Independent Effects") {
+    for (j in 1:n_tissues) {
+      beta[, j] <- rnorm(p_causal, mean = 1, sd = 0.2)
+    }
+  } else if (scenario == "Mostly Null") {
+    for (j in 1:n_tissues) {
+      if (j <= 2) {  
+        beta[, j] <- rnorm(p_causal, mean = 1, sd = 0.2)
+      } else {
+        beta[, j] <- 0
+      }
+    }
+  } else if (scenario == "Equal Effects + Null") {
+    for (j in 1:n_tissues) {
+      if (j <= ceiling(n_tissues/2)) {
+        beta[, j] <- rnorm(p_causal, mean = 1, sd = 0.2)
+      } else {
+        beta[, j] <- 0
+      }
+    }
+  } else if (scenario == "Shared Effects in Subgroups") {
+    group_size <- ceiling(n_tissues/3)
+    for (j in 1:n_tissues) {
+      if (j <= group_size) {
+        beta[, j] <- rnorm(p_causal, mean = 1, sd = 0.2)
+      } else if (j <= 2*group_size) {
+        beta[, j] <- rnorm(p_causal, mean = -0.8, sd = 0.2)
+      } else {
+        beta[, j] <- 0
+      }
+    }
+  }
+  return(beta)
+}
+
+for (i in seq_along(file_list)) {
+  genename <- gsub("_sum\\.csv$", "", basename(file_list[i]))
+  cat("Processing gene:", genename, "\n")
+
+  X <- as.matrix(read.csv(file_list[i], row.names = 1))
+  p_snps <- ncol(X)
+  
+  if (i <= 400) {
+    scenario <- "Equal Effects"
+    causal_prop <- causal_proportions[1]
+  } else if (i <= 800) {
+    scenario <- "Independent Effects"
+    causal_prop <- causal_proportions[2]
+  } else if (i <= 1200) {
+    scenario <- "Mostly Null"
+    causal_prop <- causal_proportions[3]
+  } else if (i <= 1600) {
+    scenario <- "Equal Effects + Null"
+    causal_prop <- causal_proportions[4]
+  } else {
+    scenario <- "Shared Effects in Subgroups"
+    causal_prop <- causal_proportions[5]
+  }
+  p_causal <- max(1, round(p_snps * causal_prop))
+  p_causal <- min(p_causal, p_snps)  
+  causal_indices <- sample(seq_len(p_snps), p_causal)
+  beta_causal <- generate_beta(p_causal, scenario, n_tissues) * 0.3 
+  B <- matrix(0, nrow = p_snps, ncol = n_tissues)
+  B[causal_indices, ] <- beta_causal 
+  X <- scale(X, center = TRUE, scale = TRUE)
+  GReX <- X %*% B 
+  alpha_g <- rnorm(1, mean = adjusted_alpha_mean, sd = adjusted_alpha_sd)
+  L_c <- matrix(rgamma(n_samples * n_tissues, 
+                       shape = adjusted_L_shape, 
+                       rate = adjusted_L_rate),
+                nrow = n_samples, ncol = n_tissues)
+  e_gc <- matrix(rnorm(n_samples * n_tissues, 0, adjusted_noise_sd),
+                 nrow = n_samples, ncol = n_tissues)
+  lambda <- exp(GReX + alpha_g + log(L_c + 1) + e_gc) 
+  Y <- matrix(rpois(n_samples * n_tissues, lambda = lambda),
+              nrow = n_samples, ncol = n_tissues)
+  dropout_mask <- matrix(runif(n_samples * n_tissues) < dropout_rate,
+                         nrow = n_samples, ncol = n_tissues)
+  Y[dropout_mask] <- 0 
+  write.csv(Y, file.path(expression_dir, paste0(genename, ".csv")), 
+            row.names = FALSE)
+}
+
+#Simulate scRNA-seq data.
+library(data.table)
+library(foreach)
+library(doParallel)
+input_dir <- "your data"
+output_dir <- "your data"
+gene_files <- list.files(input_dir, pattern = "\\.csv$", full.names = TRUE)
+gene_names <- gsub("\\.csv$", "", basename(gene_files))
+registerDoParallel(cores = 64)  
+celltype_data <- foreach(cell_idx = 1:9, .packages = "data.table") %dopar% {
+  cell_matrix <- matrix(NA, nrow = 576, ncol = length(gene_files))
+  colnames(cell_matrix) <- gene_names
+  for(i in seq_along(gene_files)) {
+    tryCatch({
+      dt <- fread(gene_files[i], select = cell_idx)
+      if(nrow(dt) == 576) {
+        cell_matrix[, i] <- dt[[1]]  
+      } else {
+        warning(paste("File", gene_files[i], "has", nrow(dt), "rows instead of 576"))
+      }
+    }, error = function(e) {
+      warning(paste("Failed to read file", gene_files[i], ":", e$message))
+    })
+  }
+  cell_matrix
+}
+sample_names <- paste0("sample", 1:576)
+for(i in 1:9) {
+  output_file <- file.path(output_dir, paste0("celltype", i, "_expression.csv"))
+  fwrite(
+    data.frame(SampleID = sample_names, celltype_data[[i]]),
+    file = output_file,
+    row.names = FALSE
+  )
+}
+final_output_dir <- file.path(output_dir, "subsets")
+dir.create(final_output_dir, showWarnings = FALSE)
+registerDoParallel(cores = min(64, detectCores()))
+foreach(i = 1:9) %dopar% {
+  input_file <- file.path(output_dir, paste0("celltype", i, "_expression.csv"))
+  output_file <- file.path(final_output_dir, paste0("celltype", i, "_64.csv"))
+  dt <- fread(input_file, nrows = 64)
+  fwrite(dt, file = output_file)
+}
+stopImplicitCluster()
+#Extract the expression matrix for each cell type.
+library(data.table) 
+input_dir <- "your data"
+library(foreach)
+library(doParallel)
+registerDoParallel(cores = 9)   
+foreach(i = 1:9) %dopar% {
+  original_file <- file.path(input_dir,  paste0("celltype", i, "_expression.csv")) 
+  new_file <- file.path(input_dir,  paste0("newcelltype", i, "_expression.csv")) 
+
+  fwrite(
+    fread(original_file, nrows = 64),  
+    file = new_file,
+    row.names  = FALSE 
+  )
+} 
+stopImplicitCluster()
+
+#Combine to obtain scRNA-seq data.
+input_dir <- "your data"
+output_path <- paste0(input_dir, "/scdata.csv") 
+first_file <- read.csv(paste0(input_dir,  "/newcelltype1_expression.csv"),  
+                       header = TRUE, row.names  = 1)
+gene_names <- rownames(first_file)  
+combined_mat <- matrix(nrow = 0, ncol = 2000)  
+for (i in 1:9) {
+  file_path <- paste0(input_dir, "/newcelltype", i, "_expression.csv") 
+  celltype_data <- as.matrix(read.csv(file_path,  header = TRUE, row.names  = 1))
+  combined_mat <- rbind(combined_mat, celltype_data)  
+}
+scdata <- t(combined_mat)
+colnames(scdata) <- paste0("sample", 1:576)
+write.csv(scdata,  output_path, row.names  = TRUE)
+
+#Obtain bulk data by weighting.
+library(data.table)
+library(foreach)
+library(doParallel)
+input_dir <- "your data"
+output_dir <- "your data"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+gene_files <- list.files(input_dir, pattern = "\\.csv$", full.names = TRUE)
+gene_names <- gsub("\\.csv$", "", basename(gene_files))
+sample_colnames <- names(fread(gene_files[1], nrows = 0)) 
+registerDoParallel(cores = 64)
+pb <- txtProgressBar(min = 0, max = 576, style = 3)
+foreach(sample_idx = 1:576, .packages = "data.table") %dopar% {
+  tryCatch({
+    sample_data <- matrix(NA, nrow = length(gene_files), ncol = 9)
+    rownames(sample_data) <- gene_names
+    colnames(sample_data) <- sample_colnames
+    for(gene_idx in seq_along(gene_files)) {
+      dt <- fread(gene_files[gene_idx], skip = sample_idx, nrows = 1)
+      sample_data[gene_idx, ] <- as.numeric(dt) 
+    }
+    fwrite(
+      as.data.frame(sample_data),
+      file.path(output_dir, paste0("sample", sample_idx, "_allcelltype.csv")),
+      row.names = TRUE
+    )
+    setTxtProgressBar(pb, sample_idx)
+  }, error = function(e) {
+    warning(paste("Failed to process sample", sample_idx, ":", e$message))
+  })
+}
+close(pb)
+stopImplicitCluster()
+
+library(gtools)
+library(data.table) 
+library(foreach)
+library(doParallel)
+input_dir <- "your data"
+output_path <- "your data"
+alpha_params <- list(
+  dominant = c(4, 1, 1, rep(0.5, 6)),  
+  balanced = rep(1, 9),                  
+  gradient = seq(3, 0.5, length.out=9)   
+)
+registerDoParallel(cores = 16)
+bulkdata <- foreach(i = 1:576, .combine = rbind) %dopar% {
+  raw_data <- fread(file.path(input_dir,  paste0("sample", i, "_allcelltype.csv"))) 
+  mat <- as.matrix(raw_data[,  -1, with = FALSE])  
+  storage.mode(mat)  <- "numeric" 
+  weight_type <- c("dominant", "balanced", "gradient")[(i-1) %/% 192 + 1]
+  weights <- gtools::rdirichlet(1, alpha = alpha_params[[weight_type]])
+  weighted <- mat %*% t(weights)
+  t(weighted)
+}
+rownames(bulkdata) <- paste0("sample", 1:576)
+gene_names <- rownames(read.csv( 
+  file.path(input_dir,  "sample1_allcelltype.csv"), 
+  header = TRUE,
+  row.names  = 1
+))
+colnames(bulkdata) <- gene_names 
+stopImplicitCluster()
+write.csv( 
+  bulkdata,
+  file = output_path,
+  row.names  = TRUE 
+)
+
+
+#BayesPrism
+bulk_data <- read.csv("bulkdata.csv", 
+                      header = TRUE, row.names = 1, check.names = FALSE)
+sc_data <- read.csv("scdata.csv",
+                    header = TRUE, row.names = 1, check.names = FALSE)
+
+library("BayesPrism")
+library(dplyr)
+scRNA_data=t(sc_data)
+cell.type.labels <- rep(0:8, each = 64)
+log_bulk_data <- log(bulk_data + 1)  
+log_sc_data <- log(sc_data + 1)      
+bulk_data <- round(log_bulk_data)
+scRNA_data <- round(log_sc_data)
+bulk_data <- as.matrix(bulk_data)   
+scRNA_data <- as.matrix(scRNA_data)  
+
+scRNA_data=t(scRNA_data)
+myPrism <- new.prism(
+  reference=scRNA_data, 
+  mixture=bulk_data,
+  input.type="count.matrix",
+  cell.type.labels = cell.type.labels, 
+  cell.state.labels = NULL,
+  key=NULL,# 
+  outlier.cut=0.01,
+  outlier.fraction=0.1,
+)
+bp.res <- run.prism(prism = myPrism, n.cores=64)
+weight_dir <- "your data"
+theta <- get.fraction(bp = bp.res, which.theta = "final", state.or.type = "type")
+Z_sample <- get.exp(bp = bp.res, state.or.type = "type", cell.name = colnames(theta)[1])
+gene_names <- colnames(Z_sample)
+
+library(data.table)
+pb <- txtProgressBar(min = 0, max = length(gene_names), style = 3)
+for (i in 1:length(gene_names)) {
+  gene <- gene_names[i]
+  weight_df <- data.frame(
+    SampleID = rownames(theta),
+    theta,
+    check.names = FALSE
+  )
+  output_file <- file.path(weight_dir, paste0(gene, "_weight.csv"))
+  fwrite(weight_df, output_file, row.names = FALSE)
+  setTxtProgressBar(pb, i)
+}
+
+close(pb)
+gene_list_file <- file.path(weight_dir, "gene_list.txt")
+writeLines(gene_names, gene_list_file)
+Z.cell0 <- get.exp(bp = bp.res, state.or.type = "type", cell.name = "0")
+Z.cell1 <- get.exp(bp = bp.res, state.or.type = "type", cell.name = "1")
+Z.cell2 <- get.exp(bp = bp.res, state.or.type = "type", cell.name = "2")
+Z.cell3 <- get.exp(bp = bp.res, state.or.type = "type", cell.name = "3")
+Z.cell4 <- get.exp(bp = bp.res, state.or.type = "type", cell.name = "4")
+Z.cell5 <- get.exp(bp = bp.res, state.or.type = "type", cell.name = "5")
+Z.cell6 <- get.exp(bp = bp.res, state.or.type = "type", cell.name = "6")
+Z.cell7 <- get.exp(bp = bp.res, state.or.type = "type", cell.name = "7")
+Z.cell8 <- get.exp(bp = bp.res, state.or.type = "type", cell.name = "8")
+
+library(data.table)
+genotype_files <- list.files("genotype", pattern = "_sum\\.csv$")
+genotype_genes <- sub("_sum\\.csv$", "", genotype_files)
+z_matrices <- paste0("Z.cell", 0:8)
+common_genes <- colnames(Z.cell0)
+for (i in 1:8) {
+  current_matrix <- get(paste0("Z.cell", i))
+  common_genes <- intersect(common_genes, colnames(current_matrix))
+}
+final_genes <- intersect(common_genes, genotype_genes)
+output_dir <- "your data"
+for (i in 0:8) {
+  current_matrix <- get(paste0("Z.cell", i))
+  new_matrix <- current_matrix[, final_genes, drop = FALSE]
+  output_file <- file.path(output_dir, paste0("Z.cell", i, ".csv"))
+  fwrite(data.frame(SampleID = rownames(current_matrix), new_matrix),
+         file = output_file,
+         row.names = FALSE)
+  
+  setTxtProgressBar(pb, i + 1)
+}
+writeLines(final_genes, file.path(output_dir, "common_genes.txt"))
+
+output_dir <- "your data"
+sample_ids <- paste0("Sample", 1:576)
+
+for (gene_idx in 1:length(gene_names)) {
+  gene <- gene_names[gene_idx]
+  gene_matrix <- matrix(nrow = 576, ncol = 9)
+  colnames(gene_matrix) <- paste0("Z.cell", 0:8)
+  for (cell_idx in 0:8) {
+    cell_matrix <- get(paste0("Z.cell", cell_idx))
+    gene_matrix[, cell_idx + 1] <- cell_matrix[, gene]
+  }
+  output_df <- data.frame(SampleID = sample_ids, gene_matrix)
+  output_file <- file.path(output_dir, paste0(gene, ".csv"))
+  fwrite(output_df, file = output_file, row.names = FALSE)
+  setTxtProgressBar(pb, gene_idx)
+}
+
+#mr.alpha
+library(doParallel)
+library(foreach)
+library(mr.mash.alpha)
+library(pbapply)
+zcellgene_dir <- "your data"
+genotype_dir <- "your data"
+output_dir <- "your data"
+gene_files <- list.files(zcellgene_dir, pattern = "\\.csv$")
+gene_names <- sub("\\.csv$", "", gene_files)
+test_genes <- gene_names[1:2000]  
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+process_gene <- function(gene) {
+  tryCatch({
+    Y <- read.csv(file.path(zcellgene_dir, paste0(gene, ".csv")))
+    X <- read.csv(file.path(genotype_dir, paste0(gene, "_sum.csv")))
+    X <- X[, sapply(X, is.numeric)]
+    X_std <- scale(X, center = TRUE, scale = TRUE)
+    X <- as.matrix(X_std)
+    Y <- as.matrix(Y)
+    Y_num <- matrix(as.numeric(Y), nrow = nrow(Y), ncol = ncol(Y))
+    colnames(Y_num) <- colnames(Y)
+    rownames(Y_num) <- rownames(Y)
+    Y <- scale(Y_num)
+    S0 <- compute_canonical_covs(ncol(Y), singletons = FALSE, hetgrid = c(0, 0.001, 0.01))
+    univ_sumstats <- compute_univariate_sumstats(X, Y, standardize = TRUE)
+    scaling_grid <- autoselect.mixsd(univ_sumstats, mult = sqrt(2))^2
+    S0 <- expand_covs(S0, scaling_grid)
+    S0 <- expand_covs(S0, scaling_grid, zeromat = TRUE)
+    fit <- mr.mash(
+      X, Y, S0, 
+      w0 = rep(1 / length(S0), length(S0)),
+      V = diag(ncol(Y)) * 0.00001 + cov(Y) * 0.99999,
+      update_V = TRUE, 
+      nthreads = 1  
+    )
+    save(fit, file = file.path(output_dir, paste0(gene, ".RData")))
+    return(paste(gene, "completed successfully"))
+  }, error = function(e) {
+    return(paste("Error processing", gene, ":", e$message))
+  })
+}
+registerDoParallel(cores = 64)  
+results <- foreach(
+  gene = test_genes,
+  .packages = c("mr.mash.alpha"),  
+  .combine = "c",                   
+  .errorhandling = "pass"           
+) %dopar% {
+  process_gene(gene)
+}
+stopImplicitCluster()
+
+#Compare the power and FDR of MiXcan, PrediXcan, and mr.mash.
+set.seed(123)
+library(glmnet)
+library(tools)
+library(readr)
+library(dplyr)
+library(data.table)
+library(doParallel)
+library(bigstatsr)
+zcellgene_dir <- "your data"
+genotype_dir <- "your data"
+mrresult_dir <- "your data"
+weight_dir <- "your data"
+output_dir <- "your data"
+bulk_expression_file <- "your data"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+n_sim <- 1  
+alpha <- 0.05
+h2 <- 0.3  
+registerDoParallel(cores = 64)
+gene_list_file <- file.path(weight_dir, "gene_list.txt")
+if (file.exists(gene_list_file)) {
+  all_gene_names <- readLines(gene_list_file)
+} else {
+  weight_files <- list.files(weight_dir, pattern = "_weight\\.csv$")
+  all_gene_names <- sub("_weight\\.csv$", "", weight_files)
+}
+power_indices <- c(1:5, 401:405, 801:805, 1201:1205, 1601:1605)
+fdr_indices <- c(6:10, 406:410, 806:810, 1206:1210, 1606:1610)
+power_genes <- all_gene_names[power_indices]
+fdr_genes <- all_gene_names[fdr_indices]
+bulk_expression <- read.csv(bulk_expression_file, row.names = 1)
+bulk_expression <- as.matrix(bulk_expression)
+custom_MiXcan_optimized <- function(expression, x, cov = NULL, pi, xNameMatrix = NULL, geneName = NULL, foldid = NULL) {
+  x <- as.matrix(x); expression <- as.matrix(expression)
+  n <- nrow(x); p <- ncol(x)
+  if(is.null(xNameMatrix)) xNameMatrix <- paste0("SNP", 1:p)
+  if (is.null(foldid)) foldid <- sample(1:10, n, replace = TRUE)
+  if (is.null(cov)) {
+    pcov <- 0; xcov <- x;
+    ci <- pi - 0.5; z <- ci * x; z <- as.matrix(z); xx <- as.matrix(cbind(ci, x, z))
+  } else {
+    cov <- as.matrix(cov)
+    pcov <- ncol(cov); xcov <- as.matrix(cbind(x, cov))
+    ci <- pi - 0.5; z <- ci * x;
+    xx <- as.matrix(cbind(ci, x, z, cov))
+  }
+  ft00 <- glmnet::cv.glmnet(x = xcov, y = expression, family = "gaussian", foldid = foldid, alpha = 0.5)
+  ft0 <- glmnet::glmnet(x = xcov, y = expression, family = "gaussian", lambda = ft00$lambda.min, alpha = 0.5)
+  est.tissue <- c(ft0$a0, as.numeric(ft0$beta))
+  ft11 <- glmnet::cv.glmnet(x = xx, y = expression,
+                            penalty.factor = c(0, rep(1, ncol(xx) - 1)),
+                            family = "gaussian", foldid = foldid, alpha = 0.5)
+  ft <- glmnet::glmnet(x = xx, y = expression, 
+                       penalty.factor = c(0, rep(1, ncol(xx) - 1)), 
+                       family = "gaussian",
+                       lambda = ft11$lambda.min, alpha = 0.5)    
+  est <- c(ft$a0, as.numeric(ft$beta))
+  beta10 <- est[1] + est[2] / 2
+  beta20 <- est[1] - est[2] / 2
+  beta11 <- est[3:(p + 2)] + est[(p + 3):(2 * p + 2)] / 2
+  beta21 <- est[3:(p + 2)] - est[(p + 3):(2 * p + 2)] / 2
+  Type <- "NonSpecific"
+  idx.nonzero <- which(abs(est[-1]) > 1e-6)
+  if (length(idx.nonzero) > 0) Type <- "CellTypeSpecific"
+  
+  if (Type != "CellTypeSpecific") {
+    beta1 <- beta2 <- est.tissue
+  } else {
+    if (is.null(cov)) {
+      beta1 <- c(beta10, beta11)
+      beta2 <- c(beta20, beta21)
+    } else {
+      beta_cov <- est[(2 * p + 3):(2 * p + 2 + pcov)]
+      beta1 <- c(beta10, beta11, beta_cov)
+      beta2 <- c(beta20, beta21, beta_cov)
+    }
+  }
+  beta.all.models <- cbind(est.tissue, beta1, beta2)
+  colnames(beta.all.models) <- c("Tissue", "Cell1", "Cell2")
+  beta.SNP.cell1 <- data.frame(SNP = xNameMatrix, weight = beta1[2:(p + 1)])
+  beta.SNP.cell2 <- data.frame(SNP = xNameMatrix, weight = beta2[2:(p + 1)])
+  if (suppressWarnings(all(abs(c(beta.SNP.cell1$weight, beta.SNP.cell2$weight)) < 1e-6))) {
+    Type <- "NoPredictor"
+  }
+  
+  return(list(type = Type,
+              beta.SNP.cell1 = beta.SNP.cell1,
+              beta.SNP.cell2 = beta.SNP.cell2,
+              beta.all.models = beta.all.models))
+}
+cauchy_combine <- function(pvec) {
+  pvec[pvec < 1e-300] <- 1e-300
+  pvec[pvec > (1 - 1e-16)] <- 1 - 1e-16
+  tans <- tan((0.5 - pvec) * pi)
+  stat <- mean(tans)
+  0.5 - atan(stat) / pi
+}
+calculate_twas_z_corrected <- function(weights, Z_gwas, genotype_matrix, gene_name) {
+  tryCatch({
+    if (length(weights) != length(Z_gwas)) {
+      return(list(z_score = 0, p_value = 1.0))
+    }
+    
+    valid_idx <- !is.na(weights) & !is.na(Z_gwas) & !is.infinite(weights) & !is.infinite(Z_gwas)
+    weights_valid <- weights[valid_idx]
+    Z_gwas_valid <- Z_gwas[valid_idx]
+    
+    if (length(weights_valid) == 0) {
+      return(list(z_score = 0, p_value = 1.0))
+    }
+    
+    X_sub <- genotype_matrix[, valid_idx, drop = FALSE]
+    col_sd <- apply(X_sub, 2, sd, na.rm = TRUE)
+    valid_cols <- col_sd > 1e-6
+    
+    if (sum(valid_cols) == 0) {
+      return(list(z_score = 0, p_value = 1.0))
+    }
+    if (sum(valid_cols) == 1) {
+      z_score <- Z_gwas_valid[valid_cols][1]
+      p_value <- 2 * pnorm(-abs(z_score))
+      return(list(z_score = z_score, p_value = p_value))
+    }
+    X_std <- scale(X_sub[, valid_cols, drop = FALSE])
+    X_std[is.na(X_std)] <- 0
+    
+    if (ncol(X_std) > 1) {
+      X_big <- as_FBM(X_std)
+      V <- big_cor(X_big)[, ]
+      V[is.na(V)] <- 0
+      V[is.infinite(V)] <- 0
+      diag(V) <- 1
+    } else {
+      V <- matrix(1, nrow = 1, ncol = 1)
+    }
+    b <- as.numeric(weights_valid[valid_cols])
+    Zmat <- matrix(Z_gwas_valid[valid_cols], ncol = 1)
+    if (length(b) != ncol(V)) {
+      if (length(b) > ncol(V)) {
+        b <- b[1:ncol(V)]
+        Zmat <- Zmat[1:ncol(V), , drop = FALSE]
+      } else {
+        b <- c(b, rep(0, ncol(V) - length(b)))
+      }
+    }
+    denom <- as.numeric(t(b) %*% V %*% b)
+    if (is.na(denom) || denom <= 0) denom <- abs(denom) + 1e-8
+    numerator <- as.numeric(t(b) %*% Zmat)
+    z_score <- numerator / sqrt(denom)
+    if (is.na(z_score) || is.infinite(z_score)) {
+      z_score <- 0
+    }
+    p_value <- 2 * pnorm(-abs(z_score))
+    return(list(z_score = z_score, p_value = p_value))
+  }, error = function(e) {
+    return(list(z_score = 0, p_value = 1.0))
+  })
+}
+simulate_phenotype_optimized <- function(gene_name, causal = TRUE) {
+  tryCatch({
+    expr_file <- file.path(zcellgene_dir, paste0(gene_name, ".csv"))
+    weight_file <- file.path(weight_dir, paste0(gene_name, "_weight.csv"))
+    
+    if (!file.exists(expr_file) || !file.exists(weight_file)) {
+      return(NULL)
+    }
+    Y <- as.matrix(read.csv(expr_file, row.names = 1))
+    weight_data <- read.csv(weight_file)
+    n_samples <- nrow(Y)
+    cell_types <- colnames(weight_data)[-1]
+    if (causal) {
+      n_causal_cells <- max(1, round(length(cell_types) * 0.3))  
+      causal_indices <- sample(length(cell_types), n_causal_cells)
+      beta_true <- rep(0, length(cell_types))
+      beta_true[causal_indices] <- rnorm(n_causal_cells, 0, 1)        
+      genetic_part <- numeric(n_samples)
+      for (i in 1:n_samples) {
+        genetic_part[i] <- sum(beta_true * as.numeric(weight_data[i, -1]) * Y[i, ])
+      }
+      V_g_current <- var(genetic_part)
+      if (V_g_current < 1e-10) return(NULL)
+      genetic_part_scaled <- genetic_part / sqrt(V_g_current) * sqrt(h2)
+      error_term <- rnorm(n_samples, 0, sqrt(1 - h2))
+      phenotype <- genetic_part_scaled + error_term
+      return(list(
+        phenotype = phenotype,
+        genetic_part = genetic_part_scaled,
+        beta_true = beta_true,
+        causal = causal
+      ))
+    } else {
+      phenotype <- rnorm(n_samples, 0, 1)
+      return(list(
+        phenotype = phenotype,
+        genetic_part = rep(0, n_samples),
+        beta_true = rep(0, length(cell_types)),
+        causal = causal
+      ))
+    }
+  }, error = function(e) {
+    return(NULL)
+  })
+}
+calculate_gwas_summary_continuous <- function(phenotype, genotype_matrix) {
+  n_snps <- ncol(genotype_matrix)
+  Z_gwas <- numeric(n_snps)
+  for (i in 1:n_snps) {
+    snp <- genotype_matrix[, i]
+    if (sd(snp, na.rm = TRUE) < 1e-10) {
+      Z_gwas[i] <- 0
+      next
+    }
+    tryCatch({
+      model <- lm(phenotype ~ snp)
+      coef_summary <- summary(model)$coefficients
+      if (nrow(coef_summary) >= 2 && !is.na(coef_summary[2, 4])) {
+        beta <- coef_summary[2, 1]
+        se <- coef_summary[2, 2]
+        Z_gwas[i] <- beta / se
+      } else {
+        Z_gwas[i] <- 0
+      }
+    }, error = function(e) {
+      Z_gwas[i] <- 0
+    })
+  }
+  Z_gwas[is.na(Z_gwas)] <- 0
+  Z_gwas[is.infinite(Z_gwas)] <- 0
+  
+  return(Z_gwas)
+}
+run_twas_analysis_optimized <- function(gene_name, phenotype, genotype_matrix, method = "mixcan") {
+  tryCatch({
+    Z_gwas <- calculate_gwas_summary_continuous(phenotype, genotype_matrix)
+    expression_vector <- bulk_expression[, gene_name]
+    if (method == "mixcan") {
+      weight_file <- file.path(weight_dir, paste0(gene_name, "_weight.csv"))
+      weight_data <- read.csv(weight_file)
+      pi <- rowMeans(weight_data[, -1])
+      mixcan_result <- custom_MiXcan_optimized(
+        expression = expression_vector, 
+        x = genotype_matrix, 
+        pi = pi,
+        xNameMatrix = colnames(genotype_matrix),
+        geneName = gene_name
+      )
+      if (mixcan_result$type == "CellTypeSpecific") {
+        weights_cell1 <- mixcan_result$beta.SNP.cell1$weight
+        weights_cell2 <- mixcan_result$beta.SNP.cell2$weight
+        weights_cell1[is.na(weights_cell1)] <- 0
+        weights_cell2[is.na(weights_cell2)] <- 0
+        result_cell1 <- calculate_twas_z_corrected(weights_cell1, Z_gwas, genotype_matrix, paste0(gene_name, "_cell1"))
+        result_cell2 <- calculate_twas_z_corrected(weights_cell2, Z_gwas, genotype_matrix, paste0(gene_name, "_cell2"))
+        p_cell1 <- result_cell1$p_value
+        p_cell2 <- result_cell2$p_value
+        combined_p <- cauchy_combine(c(p_cell1, p_cell2))
+        return(combined_p)
+      } else {
+        weights_tissue <- mixcan_result$beta.all.models[, "Tissue"][-1]
+        weights_tissue[is.na(weights_tissue)] <- 0
+        result_tissue <- calculate_twas_z_corrected(weights_tissue, Z_gwas, genotype_matrix, gene_name)
+        return(result_tissue$p_value)
+      }
+    } else if (method == "predixcan") {
+      cv_fit <- cv.glmnet(x = genotype_matrix, y = expression_vector, alpha = 0.5, nfolds = 5)
+      weights <- as.numeric(coef(cv_fit, s = "lambda.min"))[-1]        
+      weights[is.na(weights)] <- 0
+      result <- calculate_twas_z_corrected(weights, Z_gwas, genotype_matrix, gene_name)
+      return(result$p_value)
+    }
+  }, error = function(e) {
+    cat("TWAS analysis error:", e$message, "\n")
+    return(1.0)
+  })
+}
+run_mr_twas_optimized <- function(gene_name, phenotype, genotype_matrix) {
+  tryCatch({
+    mr_file <- file.path(mrresult_dir, paste0(gene_name, ".RData"))
+    if (!file.exists(mr_file)) {
+      return(1.0)
+    }
+    load(mr_file)
+    beta <- NULL
+    if (exists("fit")) {
+      beta <- fit$mu1
+    } else if (exists("results")) {
+      beta <- results$beta_hat
+    } else {
+      all_objects <- ls()
+      for (obj_name in all_objects) {
+        obj <- get(obj_name)
+        if (is.matrix(obj) && nrow(obj) > 0 && ncol(obj) > 0) {
+          beta <- obj
+          break
+        }
+      }
+    }
+    if (is.null(beta) || nrow(beta) == 0) {
+      return(1.0)
+    }
+    Z_gwas <- calculate_gwas_summary_continuous(phenotype, genotype_matrix)
+    celltype_pvals <- numeric(0)
+    for (cell_idx in 1:ncol(beta)) {
+      weights <- beta[, cell_idx]
+      weights[is.na(weights)] <- 0
+      if (all(abs(weights) < 1e-6)) {
+        next
+      }
+      result <- calculate_twas_z_corrected(weights, Z_gwas, genotype_matrix, paste0(gene_name, "_cell", cell_idx))
+      if (!is.na(result$p_value) && !is.infinite(result$p_value)) {
+        celltype_pvals <- c(celltype_pvals, result$p_value)
+      }
+    }
+    if (length(celltype_pvals) == 0) {
+      return(1.0)
+    }
+    combined_p <- cauchy_combine(celltype_pvals)
+    return(combined_p)
+  }, error = function(e) {
+    cat("MR analysis error:", e$message, "\n")
+    return(1.0)
+  })
+}
+load_genotype_data <- function(gene_name) {
+  tryCatch({
+    geno_file <- file.path(genotype_dir, paste0(gene_name, "_sum.csv"))
+    if (!file.exists(geno_file)) {
+      return(NULL)
+    }
+    x_raw <- read.csv(geno_file, row.names = 1)
+    x <- as.matrix(x_raw)
+    x <- apply(x, 2, as.numeric)
+    n_samples <- nrow(x)
+    if (n_samples == 0) {
+      return(NULL)
+    }
+    x_std <- scale(x)
+    x_std[is.na(x_std)] <- 0
+    return(x_std)
+  }, error = function(e) {
+    cat("Error loading genotype data:", e$message, "\n")
+    return(NULL)
+  })
+}
+all_results <- data.frame()
+power_gene_results <- foreach(gene = power_genes, .combine = rbind, 
+                              .packages = c("glmnet", "dplyr", "bigstatsr", "data.table")) %dopar% {
+                                genotype_matrix <- load_genotype_data(gene)
+                                gene_results <- data.frame()
+                                for (sim in 1:n_sim) {
+                                  phenotype_result_power <- simulate_phenotype_optimized(gene, causal = TRUE)
+                                  if (!is.null(phenotype_result_power)) {
+                                    phenotype_power <- phenotype_result_power$phenotype
+                                    predixcan_pval_power <- run_twas_analysis_optimized(gene, phenotype_power, genotype_matrix, "predixcan")
+                                    mixcan_pval_power <- run_twas_analysis_optimized(gene, phenotype_power, genotype_matrix, "mixcan")
+                                    mr_pval_power <- run_mr_twas_optimized(gene, phenotype_power, genotype_matrix)
+                                    power_result <- data.frame(
+                                      Gene = gene,
+                                      Simulation = sim,
+                                      Analysis_Type = "Power",
+                                      PrediXcan_Pvalue = predixcan_pval_power,
+                                      MiXcan_Pvalue = mixcan_pval_power,
+                                      MR_Pvalue = mr_pval_power
+                                    )
+                                    gene_results <- rbind(gene_results, power_result)
+                                  }
+                                }
+                                rm(genotype_matrix)
+                                gc()
+                                gene_results
+                              }
+fdr_gene_results <- foreach(gene = fdr_genes, .combine = rbind, 
+                            .packages = c("glmnet", "dplyr", "bigstatsr", "data.table")) %dopar% {
+                              genotype_matrix <- load_genotype_data(gene)
+                              gene_results <- data.frame()
+                              for (sim in 1:n_sim) {
+                                phenotype_result_fdr <- simulate_phenotype_optimized(gene, causal = FALSE)
+                                if (!is.null(phenotype_result_fdr)) {
+                                  phenotype_fdr <- phenotype_result_fdr$phenotype
+                                  predixcan_pval_fdr <- run_twas_analysis_optimized(gene, phenotype_fdr, genotype_matrix, "predixcan")
+                                  mixcan_pval_fdr <- run_twas_analysis_optimized(gene, phenotype_fdr, genotype_matrix, "mixcan")
+                                  mr_pval_fdr <- run_mr_twas_optimized(gene, phenotype_fdr, genotype_matrix)
+                                  fdr_result <- data.frame(
+                                    Gene = gene,
+                                    Simulation = sim,
+                                    Analysis_Type = "FDR",
+                                    PrediXcan_Pvalue = predixcan_pval_fdr,
+                                    MiXcan_Pvalue = mixcan_pval_fdr,
+                                    MR_Pvalue = mr_pval_fdr
+                                  )
+                                  gene_results <- rbind(gene_results, fdr_result)
+                                }
+                              }
+                              rm(genotype_matrix)
+                              gc()
+                              gene_results
+                            }
+all_gene_results <- rbind(power_gene_results, fdr_gene_results)
+power_results <- all_gene_results[all_gene_results$Analysis_Type == "Power", ]
+fdr_results <- all_gene_results[all_gene_results$Analysis_Type == "FDR", ]
+power_predixcan <- mean(power_results$PrediXcan_Pvalue < alpha, na.rm = TRUE)
+power_mixcan <- mean(power_results$MiXcan_Pvalue < alpha, na.rm = TRUE)
+power_mr <- mean(power_results$MR_Pvalue < alpha, na.rm = TRUE)
+fdr_predixcan <- mean(fdr_results$PrediXcan_Pvalue < alpha, na.rm = TRUE)
+fdr_mixcan <- mean(fdr_results$MiXcan_Pvalue < alpha, na.rm = TRUE)
+fdr_mr <- mean(fdr_results$MR_Pvalue < alpha, na.rm = TRUE)
+results_summary <- data.frame(
+  Method = c("PrediXcan", "MiXcan", "MR"),
+  Power = c(power_predixcan, power_mixcan, power_mr),
+  FDR = c(fdr_predixcan, fdr_mixcan, fdr_mr),
+  Simulations = n_sim,
+  Power_Genes_Tested = length(power_genes),
+  FDR_Genes_Tested = length(fdr_genes),
+  Total_Tests = nrow(power_results) + nrow(fdr_results)
+)
+write.csv(all_gene_results, file.path(output_dir, "all_gene_results_final.csv"), row.names = FALSE)
+write.csv(results_summary, file.path(output_dir, "power_fdr_summary_final.csv"), row.names = FALSE)
+stopImplicitCluster()
